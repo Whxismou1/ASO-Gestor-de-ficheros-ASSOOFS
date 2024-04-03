@@ -6,6 +6,7 @@
 #include <linux/buffer_head.h> /* buffer_head           */
 #include <linux/slab.h>        /* kmem_cache            */
 #include "assoofs.h"
+MODULE_LICENSE("GPL");
 /*
     Mis funciones
 */
