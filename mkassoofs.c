@@ -18,6 +18,7 @@ static int write_superblock(int fd) {
         .block_size = ASSOOFS_DEFAULT_BLOCK_SIZE,
         .inodes_count = WELCOMEFILE_INODE_NUMBER,
         .free_blocks = (~0) & ~(15),
+        .free_inodes = (~0) & ~(7),
     };
     ssize_t ret;
 
@@ -122,6 +123,7 @@ int main(int argc, char *argv[])
     struct assoofs_dir_record_entry record = {
         .filename = "README.txt",
         .inode_no = WELCOMEFILE_INODE_NUMBER,
+        .entry_removed = ASSOOFS_FALSE
     };
 
     if (argc != 2) {

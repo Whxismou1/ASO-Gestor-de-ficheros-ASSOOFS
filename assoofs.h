@@ -7,7 +7,9 @@ const int ASSOOFS_SUPERBLOCK_BLOCK_NUMBER = 0;
 const int ASSOOFS_INODESTORE_BLOCK_NUMBER = 1;  
 const int ASSOOFS_ROOTDIR_BLOCK_NUMBER = 2;     
 const int ASSOOFS_ROOTDIR_INODE_NUMBER = 1;     
-const int ASSOOFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED = 64;  
+const int ASSOOFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED = 64;
+const int ASSOOFS_TRUE = 1;
+const int ASSOOFS_FALSE = 0;
 
 struct assoofs_super_block_info {
     uint64_t version; 
@@ -15,13 +17,14 @@ struct assoofs_super_block_info {
     uint64_t block_size;    
     uint64_t inodes_count;
     uint64_t free_blocks;  
-
-    char padding[4056];     
+    uint64_t free_inodes;
+    char padding[4048];     
 };
 
 struct assoofs_dir_record_entry {
     char filename[ASSOOFS_FILENAME_MAXLEN]; 
-    uint64_t inode_no;  
+    uint64_t inode_no; 
+    uint64_t entry_removed; 
 };
 
 

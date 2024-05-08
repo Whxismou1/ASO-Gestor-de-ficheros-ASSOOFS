@@ -10,14 +10,88 @@ MODULE_LICENSE("GPL");
 /*
     Mis funciones
 */
+// Parte opcional B: Cache d inodos
+static struct kmem_cache *assoofs_inode_cache;
+
+// Parte opcional C: Bloqueo de superbloque y recursos compartidos
+static DEFINE_MUTEX(assoofs_sb_lock);
+static DEFINE_MUTEX(assoofs_storageInodos_lock);
+
+int assoofs_sb_set_a_freeblock(struct super_block *sb, uint64_t block);
+int assoofs_sb_get_a_freeinode(struct super_block *sb, unsigned long *inode);
+static int assoofs_remove(struct inode *dir, struct dentry *dentry);
+int assoofs_sb_set_a_freeinode(struct super_block *sb, unsigned long inode_no);
+static int assoofs_create(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl);
+struct dentry *assoofs_lookup(struct inode *parent_inode, struct dentry *child_dentry, unsigned int flags);
+static int assoofs_mkdir(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode);
 struct assoofs_inode_info *assoofs_get_inode_info(struct super_block *sb, uint64_t inode_no);
 static struct inode *assoofs_get_inode(struct super_block *sb, int ino);
 int assoofs_save_inode_info(struct super_block *sb, struct assoofs_inode_info *inode_info);
+int assoofs_destroy_inode(struct inode *inode);
+static int assoofs_iterate(struct file *filp, struct dir_context *ctx);
+ssize_t assoofs_read(struct file *filp, char __user *buf, size_t len, loff_t *ppos);
+int assoofs_sb_get_a_freeblock(struct super_block *sb, uint64_t *block);
+void assoofs_save_sb_info(struct super_block *vsb);
+struct assoofs_inode_info *assoofs_search_inode_info(struct super_block *sb, struct assoofs_inode_info *start, struct assoofs_inode_info *search);
+
+void assoofs_add_inode_info(struct super_block *sb, struct assoofs_inode_info *inode);
+
+static int assoofs_remove(struct inode *dir, struct dentry *dentry){
+    struct super_block *sb;
+    struct inode *inode_remove;
+    struct assoofs_inode_info *inode_info_remove;
+    struct assoofs_inode_info *parent_inode_info;
+    struct buffer_head *bh;
+    struct assoofs_dir_record_entry *dir_contents;
+    int i;
+    sb = dir->i_sb;
+    inode_remove = dentry->d_inode;
+    inode_info_remove = inode_remove->i_private;
+    parent_inode_info = dir->i_private;
+    bh = sb_bread(sb, parent_inode_info->data_block_number);
+    dir_contents = (struct assoofs_dir_record_entry*)bh->b_data;
+    for(i = 0; parent_inode_info->dir_children_count; i++){
+        if (!strcmp(dir_contents->filename, dentry->d_name.name) && dir_contents->inode_no == inode_remove->i_ino){
+                
+            printk(KERN_INFO "Found dir_record_entry to remove: %s\n", dir_contents->filename);
+            
+            dir_contents->entry_removed = ASSOOFS_TRUE;
+            
+            break;
+        }
+    
+        dir_contents++;
+    }
+
+    mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
+    brelse(bh);
+    assoofs_sb_set_a_freeinode(sb, inode_info_remove->inode_no);
+    assoofs_sb_set_a_freeblock(sb, inode_info_remove->data_block_number);
+    return 0;
+
+}
+
+int assoofs_sb_set_a_freeinode(struct super_block *sb, unsigned long inode_no){
+    struct assoofs_super_block_info *assoofs_sb = sb->s_fs_info;
+    assoofs_sb->free_inodes |= (1 << inode_no);
+    assoofs_save_sb_info(sb);
+    return 0;
+}
+
+int assoofs_sb_set_a_freeblock(struct super_block *sb, uint64_t block){
+    struct assoofs_super_block_info *assoofs_sb = sb->s_fs_info;
+    assoofs_sb->free_blocks |= (1 << block);
+    assoofs_save_sb_info(sb);
+    return 0;
+}
+
+
 
 /*
  *  Operaciones sobre ficheros
- */
-ssize_t assoofs_read(struct file *filp, char __user *buf, size_t len, loff_t *ppos);
+*/
+
 ssize_t assoofs_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos);
 const struct file_operations assoofs_file_operations = {
     .read = assoofs_read,
@@ -32,13 +106,16 @@ ssize_t assoofs_read(struct file *filp, char __user *buf, size_t len, loff_t *pp
     char *buffer;
 
     printk(KERN_INFO "Read request\n");
+
     inode_info = filp->f_path.dentry->d_inode->i_private;
+
     if (*ppos >= inode_info->file_size)
     {
         return 0;
     }
 
     bh = sb_bread(filp->f_path.dentry->d_inode->i_sb, inode_info->data_block_number);
+
     buffer = (char *)bh->b_data;
 
     buffer += *ppos;
@@ -64,6 +141,7 @@ ssize_t assoofs_write(struct file *filp, const char __user *buf, size_t len, lof
     char *buffer;
     int ret;
     struct super_block *sb;
+    int resultMutex;
 
     printk(KERN_INFO "Write request\n");
     if (*ppos + len > ASSOOFS_DEFAULT_BLOCK_SIZE)
@@ -72,18 +150,29 @@ ssize_t assoofs_write(struct file *filp, const char __user *buf, size_t len, lof
         return -ENOSPC;
     }
 
+    bh = sb_bread(filp->f_path.dentry->d_inode->i_sb, inode_info->data_block_number);
     buffer = (char *)bh->b_data;
     buffer += *ppos;
     ret = copy_from_user(buffer, buf, len);
 
     if (ret != 0)
     {
+
         return -EFAULT;
     }
 
     *ppos += len;
+
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
+
+
     mark_buffer_dirty(bh);
     sync_dirty_buffer(bh);
+    mutex_unlock(&assoofs_sb_lock);
+
 
     inode_info->file_size = *ppos;
     sb = filp->f_path.dentry->d_inode->i_sb;
@@ -95,7 +184,7 @@ ssize_t assoofs_write(struct file *filp, const char __user *buf, size_t len, lof
 /*
  *  Operaciones sobre directorios
  */
-static int assoofs_iterate(struct file *filp, struct dir_context *ctx);
+
 const struct file_operations assoofs_dir_operations = {
     .owner = THIS_MODULE,
     .iterate = assoofs_iterate,
@@ -114,7 +203,10 @@ static int assoofs_iterate(struct file *filp, struct dir_context *ctx)
     printk(KERN_INFO "Iterate request\n");
 
     inode = filp->f_path.dentry->d_inode;
+
+
     sb = inode->i_sb;
+
     inode_info = inode->i_private;
 
     if (ctx->pos)
@@ -131,8 +223,11 @@ static int assoofs_iterate(struct file *filp, struct dir_context *ctx)
     record = (struct assoofs_dir_record_entry *)bh->b_data;
     for (i = 0; i < inode_info->dir_children_count; i++)
     {
-        dir_emit(ctx, record->filename, ASSOOFS_FILENAME_MAXLEN, record->inode_no, DT_UNKNOWN);
-        ctx->pos += sizeof(struct assoofs_dir_record_entry);
+        if(record->entry_removed == ASSOOFS_FALSE){
+            dir_emit(ctx, record->filename, ASSOOFS_FILENAME_MAXLEN, record->inode_no, DT_UNKNOWN);
+            ctx->pos += sizeof(struct assoofs_dir_record_entry);
+        }
+
         record++;
     }
 
@@ -141,16 +236,32 @@ static int assoofs_iterate(struct file *filp, struct dir_context *ctx)
     return 0;
 }
 
+
+int assoofs_sb_get_a_freeinode(struct super_block *sb, unsigned long *inode){
+    struct assoofs_super_block_info *assoofs_sb = sb->s_fs_info;
+    int i;
+    for (i = 2; i < ASSOOFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED; i++){
+        if (assoofs_sb->free_inodes & (1 << i)){
+            break;
+        }
+    }
+    if(i >= ASSOOFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED){
+        return -1;
+    }
+    *inode = i;
+    assoofs_sb->free_inodes &= ~(1 << i);
+    assoofs_save_sb_info(sb);
+    return 0;
+}
+
 /*
  *  Operaciones sobre inodos
  */
-static int assoofs_create(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl);
-struct dentry *assoofs_lookup(struct inode *parent_inode, struct dentry *child_dentry, unsigned int flags);
-static int assoofs_mkdir(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode);
 static struct inode_operations assoofs_inode_ops = {
     .create = assoofs_create,
     .lookup = assoofs_lookup,
     .mkdir = assoofs_mkdir,
+    .unlink = assoofs_remove,
 };
 
 static struct inode *assoofs_get_inode(struct super_block *sb, int ino)
@@ -204,7 +315,7 @@ struct dentry *assoofs_lookup(struct inode *parent_inode, struct dentry *child_d
     record = (struct assoofs_dir_record_entry *)bh->b_data;
     for (i = 0; i < parent_info->dir_children_count; i++)
     {
-        if (!strcmp(record->filename, child_dentry->d_name.name))
+        if ((!strcmp(record->filename, child_dentry->d_name.name)) && record->entry_removed == ASSOOFS_FALSE)
         {
             struct inode *inode = assoofs_get_inode(sb, record->inode_no);
             inode_init_owner(sb->s_user_ns, inode, parent_inode, ((struct assoofs_inode_info *)inode->i_private)->mode);
@@ -216,17 +327,24 @@ struct dentry *assoofs_lookup(struct inode *parent_inode, struct dentry *child_d
 
     return NULL;
 }
-int assoofs_sb_get_a_freeblock(struct super_block *sb, uint64_t *block);
-void assoofs_save_sb_info(struct super_block *vsb);
+
 void assoofs_save_sb_info(struct super_block *vsb)
 {
+    int resultMutex;
     struct buffer_head *bh;
     struct assoofs_super_block_info *sb = vsb->s_fs_info;
     bh = sb_bread(vsb, ASSOOFS_SUPERBLOCK_BLOCK_NUMBER);
     bh->b_data = (char *)sb;
 
+
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
     mark_buffer_dirty(bh);
     sync_dirty_buffer(bh);
+    mutex_unlock(&assoofs_sb_lock);
+
     brelse(bh);
 }
 int assoofs_sb_get_a_freeblock(struct super_block *sb, uint64_t *block)
@@ -253,25 +371,33 @@ int assoofs_sb_get_a_freeblock(struct super_block *sb, uint64_t *block)
     return 0;
 }
 
-void assoofs_add_inode_info(struct super_block *sb, struct assoofs_inode_info *inode);
 void assoofs_add_inode_info(struct super_block *sb, struct assoofs_inode_info *inode)
 {
     struct buffer_head *bh;
     struct assoofs_super_block_info *assoofs_sb = sb->s_fs_info;
     struct assoofs_inode_info *inode_info;
+    int resultMutex;
 
     bh = sb_bread(sb, ASSOOFS_INODESTORE_BLOCK_NUMBER);
     inode_info = (struct assoofs_inode_info *)bh->b_data;
     inode_info += assoofs_sb->inodes_count;
     memcpy(inode_info, inode, sizeof(struct assoofs_inode_info));
 
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
+
     mark_buffer_dirty(bh);
     sync_dirty_buffer(bh);
-    assoofs_sb->inodes_count++;
-    assoofs_save_sb_info(sb);
+    mutex_unlock(&assoofs_sb_lock);
+
+    if (assoofs_sb->inodes_count < inode->inode_no){
+        assoofs_sb->inodes_count++;
+        assoofs_save_sb_info(sb);
+    }
 }
 
-struct assoofs_inode_info *assoofs_search_inode_info(struct super_block *sb, struct assoofs_inode_info *start, struct assoofs_inode_info *search);
 
 struct assoofs_inode_info *assoofs_search_inode_info(struct super_block *sb, struct assoofs_inode_info *start, struct assoofs_inode_info *search)
 {
@@ -297,6 +423,8 @@ int assoofs_save_inode_info(struct super_block *sb, struct assoofs_inode_info *i
 {
     struct buffer_head *bh;
     struct assoofs_inode_info *inode_pos;
+    int resultMutex;
+
     bh = sb_bread(sb, ASSOOFS_INODESTORE_BLOCK_NUMBER);
     inode_pos = assoofs_search_inode_info(sb, (struct assoofs_inode_info *)bh->b_data, inode_info);
 
@@ -307,8 +435,16 @@ int assoofs_save_inode_info(struct super_block *sb, struct assoofs_inode_info *i
     }
 
     memcpy(inode_pos, inode_info, sizeof(*inode_pos));
+
+
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
+
     mark_buffer_dirty(bh);
     sync_dirty_buffer(bh);
+    mutex_unlock(&assoofs_sb_lock);
 
     return 0;
 }
@@ -322,17 +458,24 @@ static int assoofs_create(struct user_namespace *mnt_userns, struct inode *dir, 
     struct assoofs_inode_info *parent_inode_info;
     struct assoofs_dir_record_entry *dir_contents;
     struct buffer_head *bh;
+    int resultMutexStorage;
+    int resultMutex;
+
 
     printk(KERN_INFO "New file request\n");
-
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
     sb = dir->i_sb;
+    mutex_unlock(&assoofs_sb_lock);
 
     count = ((struct assoofs_super_block_info *)sb->s_fs_info)->inodes_count;
     inode = new_inode(sb);
     inode->i_sb = sb;
     inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
     inode->i_op = &assoofs_inode_ops;
-    inode->i_ino = count + 1;
+    assoofs_sb_get_a_freeinode(sb, &inode->i_ino);
 
     if (count >= ASSOOFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED)
     {
@@ -340,7 +483,15 @@ static int assoofs_create(struct user_namespace *mnt_userns, struct inode *dir, 
         return -1;
     }
 
-    inode_info = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
+
+    resultMutexStorage = mutex_lock_interruptible(&assoofs_storageInodos_lock);
+    if(resultMutexStorage != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
+
+    // inode_info = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
+    inode_info = kmem_cache_alloc(assoofs_inode_cache, GFP_KERNEL);
+    mutex_unlock(&assoofs_storageInodos_lock);
     inode_info->inode_no = inode->i_ino;
     inode_info->mode = mode;
     inode_info->file_size = 0;
@@ -357,15 +508,29 @@ static int assoofs_create(struct user_namespace *mnt_userns, struct inode *dir, 
     // PASO 2
 
     parent_inode_info = dir->i_private;
+
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
     bh = sb_bread(sb, parent_inode_info->data_block_number);
+    mutex_unlock(&assoofs_sb_lock);
 
     dir_contents = (struct assoofs_dir_record_entry *)bh->b_data;
     dir_contents += parent_inode_info->dir_children_count;
     dir_contents->inode_no = inode_info->inode_no;
 
     strcpy(dir_contents->filename, dentry->d_name.name);
+
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
+
     mark_buffer_dirty(bh);
     sync_dirty_buffer(bh);
+    mutex_unlock(&assoofs_sb_lock);
+
     brelse(bh);
 
     // PASO 3
@@ -386,16 +551,22 @@ static int assoofs_mkdir(struct user_namespace *mnt_userns, struct inode *dir, s
     struct assoofs_inode_info *inode_info;
     struct assoofs_inode_info *parent_inode_info;
     struct assoofs_dir_record_entry *dir_contents;
+    int resultMutex;
+    int resultMutexStorage;
 
     printk(KERN_INFO "New directory request\n");
-
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
     sb = dir->i_sb;
+    mutex_unlock(&assoofs_sb_lock);
     count = ((struct assoofs_super_block_info *)sb->s_fs_info)->inodes_count;
     inode = new_inode(sb);
     inode->i_sb = sb;
     inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
     inode->i_op = &assoofs_inode_ops;
-    inode->i_ino = count + 1;
+    assoofs_sb_get_a_freeinode(sb, &inode->i_ino);
 
     if (count >= ASSOOFS_MAX_FILESYSTEM_OBJECTS_SUPPORTED)
     {
@@ -403,14 +574,20 @@ static int assoofs_mkdir(struct user_namespace *mnt_userns, struct inode *dir, s
         return -1;
     }
 
-    inode_info = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
+    resultMutexStorage = mutex_lock_interruptible(&assoofs_storageInodos_lock);
+    if(resultMutexStorage != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
+    // inode_info = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
+    inode_info = kmem_cache_alloc(assoofs_inode_cache, GFP_KERNEL);
+    mutex_unlock(&assoofs_storageInodos_lock);
+
     inode_info->inode_no = inode->i_ino;
     inode_info->mode = S_IFDIR | mode;
     inode_info->dir_children_count = 0;
-    inode_info->file_size = 0;
     inode->i_private = inode_info;
 
-    inode->i_fop = &assoofs_file_operations;
+    inode->i_fop = &assoofs_dir_operations;
     inode_init_owner(sb->s_user_ns, inode, dir, inode_info->mode);
     d_add(dentry, inode);
 
@@ -421,15 +598,28 @@ static int assoofs_mkdir(struct user_namespace *mnt_userns, struct inode *dir, s
     // PASO 2
 
     parent_inode_info = dir->i_private;
+
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
     bh = sb_bread(sb, parent_inode_info->data_block_number);
+    mutex_unlock(&assoofs_sb_lock);
 
     dir_contents = (struct assoofs_dir_record_entry *)bh->b_data;
     dir_contents += parent_inode_info->dir_children_count;
     dir_contents->inode_no = inode_info->inode_no;
 
     strcpy(dir_contents->filename, dentry->d_name.name);
+
+    resultMutex = mutex_lock_interruptible(&assoofs_sb_lock);
+    if(resultMutex != 0){
+        printk(KERN_ERR "Ha habido un error en el mutex");
+    }
     mark_buffer_dirty(bh);
     sync_dirty_buffer(bh);
+    mutex_unlock(&assoofs_sb_lock);
+
     brelse(bh);
 
     // PASO 3
@@ -444,7 +634,8 @@ static int assoofs_mkdir(struct user_namespace *mnt_userns, struct inode *dir, s
  *  Operaciones sobre el superbloque
  */
 static const struct super_operations assoofs_sops = {
-    .drop_inode = generic_delete_inode,
+    // .drop_inode = generic_delete_inode,
+    .drop_inode = assoofs_destroy_inode,
 };
 
 /*
@@ -452,6 +643,7 @@ static const struct super_operations assoofs_sops = {
  */
 int assoofs_fill_super(struct super_block *sb, void *data, int silent)
 {
+        
     // 1.- Leer la información persistente del superbloque del dispositivo de bloques
     struct assoofs_super_block_info *assoofs_sb;
     struct buffer_head *bh;
@@ -498,6 +690,7 @@ struct assoofs_inode_info *assoofs_get_inode_info(struct super_block *sb, uint64
     struct assoofs_inode_info *buffer;
     struct assoofs_super_block_info *afs_sb;
     int i;
+    int resultMutexStorage;
 
     bh = sb_bread(sb, ASSOOFS_INODESTORE_BLOCK_NUMBER);
     inode_info = (struct assoofs_inode_info *)bh->b_data;
@@ -508,7 +701,13 @@ struct assoofs_inode_info *assoofs_get_inode_info(struct super_block *sb, uint64
     {
         if (inode_info->inode_no == inode_no)
         {
-            buffer = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
+            //buffer = kmalloc(sizeof(struct assoofs_inode_info), GFP_KERNEL);
+            resultMutexStorage = mutex_lock_interruptible(&assoofs_storageInodos_lock);
+            if(resultMutexStorage != 0){
+                printk(KERN_ERR "Ha habido un error en el mutex");
+            }
+            buffer = kmem_cache_alloc(assoofs_inode_cache, GFP_KERNEL);
+            mutex_unlock(&assoofs_storageInodos_lock);
             memcpy(buffer, inode_info, sizeof(*buffer));
             break;
         }
@@ -543,12 +742,24 @@ static struct file_system_type assoofs_type = {
     .kill_sb = kill_block_super,
 };
 
+int assoofs_destroy_inode(struct inode *inode)
+{
+    struct assoofs_inode *inode_info = inode->i_private;
+
+    printk(KERN_INFO "Freeing private data of inode %p ( %lu)\n", inode_info, inode->i_ino);
+
+    kmem_cache_free(assoofs_inode_cache, inode_info);
+
+    return 0;
+}
+
 static int __init assoofs_init(void)
 {
     int ret;
     printk(KERN_INFO "assoofs_init request\n");
 
     ret = register_filesystem(&assoofs_type);
+    assoofs_inode_cache = kmem_cache_create("assoofs_inode_cache", sizeof(struct assoofs_inode_info), 0, (SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD), NULL);
     if (ret != 0)
     {
         printk(KERN_ERR "Error registering assoofs\n");
@@ -567,6 +778,7 @@ static void __exit assoofs_exit(void)
     int ret;
     printk(KERN_INFO "assoofs_exit request\n");
     ret = unregister_filesystem(&assoofs_type);
+    kmem_cache_destroy(assoofs_inode_cache);
     if (ret != 0)
     {
 
